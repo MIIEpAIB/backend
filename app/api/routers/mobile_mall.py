@@ -1,9 +1,14 @@
 """移动端接口 v1：商城 /api/mall/*, /api/account/recharge/*"""
 
-from fastapi import APIRouter, Depends, Query
+from datetime import datetime
+from decimal import Decimal
+import random
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from backend.app.api.mobile_deps import mobile_user_id_from_header
 from backend.app.db import models
 from backend.app.db.database import get_db
 from backend.app.schemas.common import APIResponse
@@ -174,16 +179,187 @@ def mobile_mall_cart_add(body: MallCartAddBody):
     return APIResponse(code=0, msg="ok", data={"cart_id": "uuid", "message": "加入购物车成功"})
 
 
-class MallOrderCreateBody(BaseModel):
+class MallOrderLine(BaseModel):
     product_id: str = ""
     quantity: int = 1
+
+
+class MallOrderCreateBody(BaseModel):
     address_id: str = ""
+    pay_method: str = "balance"
+    items: list[MallOrderLine] | None = None
+    product_id: str = ""
+    quantity: int = 1
+
+
+def _gen_order_no() -> str:
+    return "M" + datetime.utcnow().strftime("%Y%m%d%H%M%S") + str(random.randint(1000, 9999))
 
 
 @router_mall.post("/order/create", response_model=APIResponse[dict])
-def mobile_mall_order_create(body: MallOrderCreateBody):
-    """移动端：立即购买创建订单"""
-    return APIResponse(code=0, msg="ok", data={"order_id": "uuid", "order_no": "", "total_amount": 0})
+def mobile_mall_order_create(
+    body: MallOrderCreateBody,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
+):
+    """移动端：创建实物商品订单（待支付）。"""
+    lines = list(body.items or [])
+    if not lines:
+        lines = [MallOrderLine(product_id=body.product_id, quantity=body.quantity)]
+    lines = [ln for ln in lines if (ln.product_id or "").strip() and int(ln.quantity or 0) > 0]
+    if not lines:
+        raise HTTPException(status_code=400, detail="请选择商品")
+
+    try:
+        aid = int(body.address_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="请选择收货地址")
+    addr = db.get(models.UserAddress, aid)
+    if not addr or int(addr.user_id) != int(user_id):
+        raise HTTPException(status_code=400, detail="收货地址无效")
+
+    pm = (body.pay_method or "balance").lower()
+    if pm not in ("balance", "wechat", "alipay"):
+        pm = "balance"
+
+    amount_product = Decimal("0")
+    order_lines: list[tuple[models.Product, int, Decimal]] = []
+    for ln in lines:
+        try:
+            pid = int(ln.product_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"商品不存在：{ln.product_id}")
+        p = db.get(models.Product, pid)
+        if not p or p.status != "on":
+            raise HTTPException(status_code=400, detail="商品已下架或不存在")
+        qty = int(ln.quantity)
+        if qty < 1:
+            raise HTTPException(status_code=400, detail="购买数量无效")
+        if int(p.stock or 0) < qty:
+            raise HTTPException(status_code=400, detail=f"库存不足：{p.name}")
+        line_price = Decimal(str(p.price))
+        amount_product += line_price * qty
+        order_lines.append((p, qty, line_price))
+
+    amount_shipping = Decimal("0")
+    amount_total = amount_product + amount_shipping
+
+    order_no = _gen_order_no()
+    while db.query(models.ProductOrder).filter(models.ProductOrder.order_no == order_no).first():
+        order_no = _gen_order_no()
+
+    order = models.ProductOrder(
+        order_no=order_no,
+        user_id=user_id,
+        address_id=aid,
+        amount_product=amount_product,
+        amount_shipping=amount_shipping,
+        amount_total=amount_total,
+        pay_status="unpaid",
+        ship_status="unshipped",
+        pay_method=pm,
+    )
+    db.add(order)
+    db.flush()
+
+    cat_name_cache: dict[int, str] = {}
+    for p, qty, line_price in order_lines:
+        cid = int(p.category_id)
+        if cid not in cat_name_cache:
+            c = db.get(models.ProductCategory, cid)
+            cat_name_cache[cid] = c.name if c else ""
+        line_total = line_price * qty
+        db.add(
+            models.ProductOrderItem(
+                order_id=order.id,
+                product_id=p.id,
+                product_name=p.name,
+                category_name=cat_name_cache[cid],
+                price=line_price,
+                quantity=qty,
+                amount=line_total,
+            )
+        )
+
+    db.commit()
+    db.refresh(order)
+    return APIResponse(
+        code=0,
+        msg="ok",
+        data={
+            "order_id": str(order.id),
+            "order_no": order.order_no,
+            "total_amount": float(order.amount_total),
+            "pay_status": order.pay_status,
+            "pay_method": order.pay_method,
+        },
+    )
+
+
+class MallOrderPayBody(BaseModel):
+    order_id: str = ""
+    pay_method: str = "balance"
+
+
+@router_mall.post("/order/pay", response_model=APIResponse[dict])
+def mobile_mall_order_pay(
+    body: MallOrderPayBody,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
+):
+    """移动端：支付商城订单（余额扣款；微信/支付宝为开发态模拟成功）。"""
+    try:
+        oid = int(body.order_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="订单无效")
+
+    o = db.get(models.ProductOrder, oid)
+    if not o or int(o.user_id) != int(user_id):
+        raise HTTPException(status_code=404, detail="订单不存在")
+    if o.pay_status == "paid":
+        return APIResponse(
+            code=0,
+            msg="ok",
+            data={"order_id": str(o.id), "order_no": o.order_no, "order_status": "paid", "message": "订单已支付"},
+        )
+
+    pm = (body.pay_method or o.pay_method or "balance").lower()
+    if pm not in ("balance", "wechat", "alipay"):
+        pm = "balance"
+
+    user = db.get(models.User, user_id)
+    if not user:
+        raise HTTPException(status_code=400, detail="用户不存在")
+
+    for it in o.items:
+        p = db.get(models.Product, it.product_id)
+        if not p:
+            raise HTTPException(status_code=400, detail="商品不存在")
+        if int(p.stock or 0) < int(it.quantity):
+            raise HTTPException(status_code=400, detail=f"库存不足：{p.name}")
+
+    if pm == "balance":
+        bal = user.balance if user.balance is not None else Decimal("0")
+        if bal < o.amount_total:
+            raise HTTPException(status_code=400, detail="余额不足，请先充值或选择其他支付方式")
+        user.balance = bal - o.amount_total
+    # wechat/alipay：不接真实收银台，直接走支付成功分支
+
+    for it in o.items:
+        p = db.get(models.Product, it.product_id)
+        if p:
+            p.stock = int(p.stock or 0) - int(it.quantity)
+
+    o.pay_method = pm
+    o.pay_status = "paid"
+    o.pay_time = datetime.utcnow()
+
+    db.commit()
+    return APIResponse(
+        code=0,
+        msg="ok",
+        data={"order_id": str(o.id), "order_no": o.order_no, "order_status": "paid", "message": "支付成功"},
+    )
 
 
 # ---------- account/recharge ----------

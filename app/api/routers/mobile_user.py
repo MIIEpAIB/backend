@@ -2,12 +2,52 @@
 import base64
 import random
 import uuid
-from fastapi import APIRouter, Query
-from pydantic import BaseModel
 
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from backend.app.api.mobile_deps import mobile_user_id_from_header
+from backend.app.core.security import create_access_token, get_password_hash
+from backend.app.db import models
+from backend.app.db.database import get_db
 from backend.app.schemas.common import APIResponse
 
 router = APIRouter(prefix="/api/user", tags=["Mobile-User"])
+
+
+def _ensure_login_user(db: Session, phone: str | None, username: str | None) -> models.User:
+    """登录用：按手机号/账号查找用户；不存在则创建（开发期便于联调）。"""
+    account = (phone or username or "").strip()
+    if not account:
+        u = db.query(models.User).order_by(models.User.id.asc()).first()
+        if u:
+            return u
+        account = "10000000001"
+    if len(account) > 20:
+        account = account[:20]
+    u = db.query(models.User).filter(models.User.mobile == account).first()
+    if u:
+        return u
+    u = models.User(
+        mobile=account,
+        password_hash=get_password_hash("123456"),
+        nickname=(username or phone or "用户")[:64],
+    )
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+def _order_status_text(o: models.ProductOrder) -> str:
+    if o.pay_status == "unpaid":
+        return "待付款"
+    if o.ship_status == "received":
+        return "已完成"
+    if o.ship_status == "shipped":
+        return "待收货"
+    return "待发货"
 
 
 def _svg_captcha(text: str) -> str:
@@ -33,13 +73,23 @@ class UserLoginBody(BaseModel):
 
 
 @router.post("/login", response_model=APIResponse[dict])
-def mobile_user_login(body: UserLoginBody):
+def mobile_user_login(body: UserLoginBody, db: Session = Depends(get_db)):
     """移动端：用户登录（账号密码+验证码），返回 token 与 user_info。实际需校验验证码与用户表。"""
-    # 存根：直接返回约定结构，后续对接 User 表与 JWT
-    return APIResponse(code=0, msg="ok", data={
-        "token": "eyJhbGciOiJIUzI1NiIs...",
-        "user_info": {"id": 1, "username": body.username or "user123", "nickname": "用户昵称", "avatar": "https://example.com/avatar.jpg"},
-    })
+    user = _ensure_login_user(db, phone=None, username=body.username)
+    token = create_access_token({"sub": str(user.id)})
+    return APIResponse(
+        code=0,
+        msg="ok",
+        data={
+            "token": token,
+            "user_info": {
+                "id": user.id,
+                "username": user.mobile,
+                "nickname": user.nickname or user.mobile,
+                "avatar": "",
+            },
+        },
+    )
 
 
 class SmsSendBody(BaseModel):
@@ -62,12 +112,18 @@ class LoginSmsBody(BaseModel):
 
 
 @router.post("/login/sms", response_model=APIResponse[dict])
-def mobile_login_sms(body: LoginSmsBody):
+def mobile_login_sms(body: LoginSmsBody, db: Session = Depends(get_db)):
     """移动端：短信验证码登录"""
-    return APIResponse(code=0, msg="ok", data={
-        "token": "eyJhbGciOiJIUzI1NiIs...",
-        "user_info": {"id": 1, "phone": body.phone, "nickname": "用户昵称", "avatar": "https://example.com/avatar.jpg"},
-    })
+    user = _ensure_login_user(db, phone=body.phone, username=None)
+    token = create_access_token({"sub": str(user.id)})
+    return APIResponse(
+        code=0,
+        msg="ok",
+        data={
+            "token": token,
+            "user_info": {"id": user.id, "phone": user.mobile, "nickname": user.nickname or user.mobile, "avatar": ""},
+        },
+    )
 
 
 class LoginPasswordBody(BaseModel):
@@ -79,12 +135,18 @@ class LoginPasswordBody(BaseModel):
 
 
 @router.post("/login/password", response_model=APIResponse[dict])
-def mobile_login_password(body: LoginPasswordBody):
+def mobile_login_password(body: LoginPasswordBody, db: Session = Depends(get_db)):
     """移动端：密码登录"""
-    return APIResponse(code=0, msg="ok", data={
-        "token": "eyJhbGciOiJIUzI1NiIs...",
-        "user_info": {"id": 1, "phone": body.phone, "nickname": "用户昵称", "avatar": "https://example.com/avatar.jpg"},
-    })
+    user = _ensure_login_user(db, phone=body.phone, username=None)
+    token = create_access_token({"sub": str(user.id)})
+    return APIResponse(
+        code=0,
+        msg="ok",
+        data={
+            "token": token,
+            "user_info": {"id": user.id, "phone": user.mobile, "nickname": user.nickname or user.mobile, "avatar": ""},
+        },
+    )
 
 
 # ---------- 个人中心（需鉴权时由前端带 Bearer token，此处先返回存根）----------
@@ -270,22 +332,125 @@ def mobile_order_list(
     page_num: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     order_status: str | None = Query(None),
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
 ):
     """移动端：我的订单列表"""
-    return APIResponse(code=0, msg="ok", data={"total": 0, "page_num": page_num, "page_size": page_size, "list": []})
+    q = db.query(models.ProductOrder).filter(models.ProductOrder.user_id == user_id)
+    if order_status:
+        key = order_status.lower()
+        if key in ("pending", "unpaid"):
+            q = q.filter(models.ProductOrder.pay_status == "unpaid")
+        elif key in ("shipped", "shipping"):
+            q = q.filter(models.ProductOrder.pay_status == "paid", models.ProductOrder.ship_status == "shipped")
+        elif key in ("completed", "done"):
+            q = q.filter(models.ProductOrder.pay_status == "paid", models.ProductOrder.ship_status == "received")
+
+    total = q.count()
+    rows = (
+        q.order_by(models.ProductOrder.id.desc())
+        .offset((page_num - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    list_ = []
+    for o in rows:
+        first = o.items[0] if o.items else None
+        qty = sum(int(i.quantity) for i in o.items) if o.items else (first.quantity if first else 0)
+        icon = ""
+        if first:
+            p = db.get(models.Product, first.product_id)
+            icon = (p.main_image if p else "") or ""
+        list_.append(
+            {
+                "order_id": str(o.id),
+                "order_no": o.order_no,
+                "product_name": first.product_name if first else "",
+                "quantity": qty,
+                "total_amount": float(o.amount_total),
+                "pay_amount": float(o.amount_total),
+                "order_status": o.pay_status,
+                "ship_status": o.ship_status,
+                "status_text": _order_status_text(o),
+                "icon": icon,
+                "created_at": o.created_at.strftime("%Y-%m-%d %H:%M:%S") if o.created_at else "",
+                "create_time": o.created_at.strftime("%Y-%m-%d %H:%M:%S") if o.created_at else "",
+            }
+        )
+    return APIResponse(code=0, msg="ok", data={"total": total, "page_num": page_num, "page_size": page_size, "list": list_})
 
 
 @router.get("/order/detail", response_model=APIResponse[dict])
-def mobile_order_detail(order_id: str = Query(...)):
+def mobile_order_detail(
+    order_id: str = Query(...),
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
+):
     """移动端：订单详情"""
-    return APIResponse(code=0, msg="ok", data={"order_id": order_id, "order_no": "", "order_status": "pending", "list": []})
+    try:
+        oid = int(order_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="订单无效")
+    o = db.get(models.ProductOrder, oid)
+    if not o or int(o.user_id) != int(user_id):
+        raise HTTPException(status_code=404, detail="订单不存在")
+    lines = []
+    for it in o.items:
+        p = db.get(models.Product, it.product_id)
+        lines.append(
+            {
+                "product_id": str(it.product_id),
+                "product_name": it.product_name,
+                "price": float(it.price),
+                "quantity": int(it.quantity),
+                "amount": float(it.amount),
+                "icon": (p.main_image if p else "") or "",
+            }
+        )
+    return APIResponse(
+        code=0,
+        msg="ok",
+        data={
+            "order_id": str(o.id),
+            "order_no": o.order_no,
+            "order_status": o.pay_status,
+            "ship_status": o.ship_status,
+            "status_text": _order_status_text(o),
+            "total_amount": float(o.amount_total),
+            "pay_amount": float(o.amount_total),
+            "created_at": o.created_at.strftime("%Y-%m-%d %H:%M:%S") if o.created_at else "",
+            "list": lines,
+        },
+    )
 
 
 # ---------- 地址 ----------
 @router.get("/address/list", response_model=APIResponse[dict])
-def mobile_address_list():
+def mobile_address_list(
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
+):
     """移动端：收货地址列表"""
-    return APIResponse(code=0, msg="ok", data={"total": 0, "list": []})
+    rows = db.query(models.UserAddress).filter(models.UserAddress.user_id == user_id).order_by(models.UserAddress.id.desc()).all()
+    list_ = []
+    for a in rows:
+        list_.append(
+            {
+                "id": a.id,
+                "address_id": str(a.id),
+                "name": a.receiver_name,
+                "receiver_name": a.receiver_name,
+                "phone": a.mobile,
+                "receiver_phone": a.mobile,
+                "province": a.province or "",
+                "city": a.city or "",
+                "district": a.district or "",
+                "detail": a.detail_addr or "",
+                "detail_address": a.detail_addr or "",
+                "is_default": bool(a.is_default),
+            }
+        )
+    return APIResponse(code=0, msg="ok", data={"total": len(list_), "list": list_})
 
 
 class AddressAddBody(BaseModel):
@@ -296,13 +461,43 @@ class AddressAddBody(BaseModel):
     city_id: str = ""
     district_id: str = ""
     detail_address: str = ""
+    province: str = ""
+    city: str = ""
+    district: str = ""
     is_default: bool = False
 
 
 @router.post("/address/add", response_model=APIResponse[dict])
-def mobile_address_add(body: AddressAddBody):
+def mobile_address_add(
+    body: AddressAddBody,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
+):
     """移动端：新增收货地址"""
-    return APIResponse(code=0, msg="ok", data={"address_id": str(uuid.uuid4()), "create_time": "", "message": "地址添加成功"})
+    if body.is_default:
+        for a in db.query(models.UserAddress).filter(models.UserAddress.user_id == user_id).all():
+            a.is_default = 0
+    prov = (body.province or body.province_id or "").strip()
+    city = (body.city or body.city_id or "").strip()
+    dist = (body.district or body.district_id or "").strip()
+    addr = models.UserAddress(
+        user_id=user_id,
+        receiver_name=body.receiver_name or "收货人",
+        mobile=body.receiver_phone or "",
+        province=prov,
+        city=city,
+        district=dist,
+        detail_addr=body.detail_address or "",
+        is_default=1 if body.is_default else 0,
+    )
+    db.add(addr)
+    db.commit()
+    db.refresh(addr)
+    return APIResponse(
+        code=0,
+        msg="ok",
+        data={"address_id": str(addr.id), "create_time": addr.created_at.strftime("%Y-%m-%d %H:%M:%S") if addr.created_at else "", "message": "地址添加成功"},
+    )
 
 
 class AddressUpdateBody(AddressAddBody):
@@ -310,9 +505,34 @@ class AddressUpdateBody(AddressAddBody):
 
 
 @router.post("/address/update", response_model=APIResponse[dict])
-def mobile_address_update(body: AddressUpdateBody):
+def mobile_address_update(
+    body: AddressUpdateBody,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
+):
     """移动端：修改收货地址"""
-    return APIResponse(code=0, msg="ok", data={"address_id": body.address_id, "message": "地址修改成功"})
+    try:
+        aid = int(body.address_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="地址无效")
+    addr = db.get(models.UserAddress, aid)
+    if not addr or int(addr.user_id) != int(user_id):
+        raise HTTPException(status_code=404, detail="地址不存在")
+    if body.is_default:
+        for a in db.query(models.UserAddress).filter(models.UserAddress.user_id == user_id).all():
+            a.is_default = 0
+    prov = (body.province or body.province_id or "").strip()
+    city = (body.city or body.city_id or "").strip()
+    dist = (body.district or body.district_id or "").strip()
+    addr.receiver_name = body.receiver_name or addr.receiver_name
+    addr.mobile = body.receiver_phone or addr.mobile
+    addr.province = prov or addr.province
+    addr.city = city or addr.city
+    addr.district = dist or addr.district
+    addr.detail_addr = body.detail_address or addr.detail_addr
+    addr.is_default = 1 if body.is_default else addr.is_default
+    db.commit()
+    return APIResponse(code=0, msg="ok", data={"address_id": str(addr.id), "message": "地址修改成功"})
 
 
 class AddressDeleteBody(BaseModel):
@@ -320,14 +540,42 @@ class AddressDeleteBody(BaseModel):
 
 
 @router.post("/address/delete", response_model=APIResponse[dict])
-def mobile_address_delete(body: AddressDeleteBody):
+def mobile_address_delete(
+    body: AddressDeleteBody,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
+):
     """移动端：删除收货地址"""
+    try:
+        aid = int(body.address_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="地址无效")
+    addr = db.get(models.UserAddress, aid)
+    if not addr or int(addr.user_id) != int(user_id):
+        raise HTTPException(status_code=404, detail="地址不存在")
+    db.delete(addr)
+    db.commit()
     return APIResponse(code=0, msg="ok", data={"message": "地址删除成功"})
 
 
 @router.post("/address/set_default", response_model=APIResponse[dict])
-def mobile_address_set_default(body: AddressDeleteBody):
+def mobile_address_set_default(
+    body: AddressDeleteBody,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(mobile_user_id_from_header),
+):
     """移动端：设置默认地址"""
+    try:
+        aid = int(body.address_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="地址无效")
+    addr = db.get(models.UserAddress, aid)
+    if not addr or int(addr.user_id) != int(user_id):
+        raise HTTPException(status_code=404, detail="地址不存在")
+    for a in db.query(models.UserAddress).filter(models.UserAddress.user_id == user_id).all():
+        a.is_default = 0
+    addr.is_default = 1
+    db.commit()
     return APIResponse(code=0, msg="ok", data={"message": "已设置为默认地址"})
 
 
