@@ -242,64 +242,60 @@ def banner_delete(
     return APIResponse[Any](code=0, msg="删除成功", data=None)
 
 
-# ---------- 专家联系方式 ----------
+# ---------- 专家信息 ----------
 @router.get("/contact-config/detail", response_model=APIResponse[dict])
 def contact_config_detail(
     db: Session = Depends(get_db),
     admin: models.AdminUser = Depends(get_current_admin),
 ):
-    rows = db.query(models.ContactConfig).all()
-    list_ = []
-    seen = set()
+    rows = db.query(models.ExpertContact).order_by(models.ExpertContact.id.asc()).all()
+    list_: list[dict] = []
     for r in rows:
-        seen.add(r.contact_type)
-        accounts = []
-        if r.account_list_json:
-            try:
-                accounts = json.loads(r.account_list_json)
-            except Exception:
-                accounts = []
-        list_.append({
-            "contact_type": r.contact_type,
-            "contact_type_name": CONTACT_TYPE_NAMES.get(r.contact_type, r.contact_type),
-            "account_list": accounts,
-            "status": r.status,
-        })
-    for ct in CONTACT_TYPE_NAMES:
-        if ct not in seen:
-            list_.append({
-                "contact_type": ct,
-                "contact_type_name": CONTACT_TYPE_NAMES[ct],
-                "account_list": [],
-                "status": 0,
-            })
+        list_.append(
+            {
+                "id": r.id,
+                "avatar_url": r.avatar_url or "",
+                "name": r.name or "",
+                "title": r.title or "",
+                "wechat": r.wechat or "",
+                "mobile": r.mobile or "",
+            }
+        )
     return APIResponse[dict](code=0, msg="ok", data={"list": list_})
 
 
-class ContactConfigItem(BaseModel):
-    contact_type: str
-    account_list: list[str] = []
-    status: int = 1
+class ExpertContactItem(BaseModel):
+    avatar_url: str = ""
+    name: str
+    title: str = ""
+    wechat: str = ""
+    mobile: str = ""
 
 
-class ContactConfigSaveBody(BaseModel):
-    list: list[ContactConfigItem]
+class ExpertContactSaveBody(BaseModel):
+    list: list[ExpertContactItem]
 
 
 @router.post("/contact-config/save", response_model=APIResponse[Any])
 def contact_config_save(
-    body: ContactConfigSaveBody,
+    body: ExpertContactSaveBody,
     db: Session = Depends(get_db),
     admin: models.AdminUser = Depends(get_current_admin),
 ):
+    # 同步专家信息：直接替换当前列表
+    db.query(models.ExpertContact).delete()
     for item in body.list:
-        r = db.query(models.ContactConfig).filter(models.ContactConfig.contact_type == item.contact_type).first()
-        json_str = json.dumps(item.account_list, ensure_ascii=False)
-        if r:
-            r.account_list_json = json_str
-            r.status = item.status
-        else:
-            db.add(models.ContactConfig(contact_type=item.contact_type, account_list_json=json_str, status=item.status))
+        if not (item.name or "").strip():
+            continue
+        db.add(
+            models.ExpertContact(
+                avatar_url=item.avatar_url or None,
+                name=item.name.strip(),
+                title=item.title or None,
+                wechat=item.wechat or None,
+                mobile=item.mobile or None,
+            )
+        )
     db.commit()
     return APIResponse[Any](code=0, msg="保存成功", data=None)
 

@@ -449,6 +449,7 @@ class ExpertContact(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     name = Column(String(64), nullable=False)
     title = Column(String(128))
+    avatar_url = Column(String(255))
     mobile = Column(String(20))
     wechat = Column(String(64))
     description = Column(String(255))

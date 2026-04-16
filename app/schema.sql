@@ -408,6 +408,7 @@ CREATE TABLE expert_contact (
   id          BIGINT PRIMARY KEY AUTO_INCREMENT,
   name        VARCHAR(64) NOT NULL,
   title       VARCHAR(128),
+  avatar_url  VARCHAR(255),
   mobile      VARCHAR(20),
   wechat      VARCHAR(64),
   description VARCHAR(255),
